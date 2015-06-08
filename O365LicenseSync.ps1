@@ -1,5 +1,4 @@
 ﻿#Copyright 2015 Joel Coehoorn. 
-# This script is provided under the CC BY 2.0 license. https://creativecommons.org/licenses/by/2.0/
 
 #Acknowledgements:
 # This script was original based on the work by Johan Dahlbom located here:
