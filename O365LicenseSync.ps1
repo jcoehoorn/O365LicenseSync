@@ -12,9 +12,6 @@
 # No support is provided for configuring your local Active Directory to the Azure tenant, and no support is provided for installing the powershell commandlets. Support inquiries in those areas will be ignored.
 # A general guide to configuring your local environment is available here: https://support.office.com/en-ca/article/Managing-Office-365-and-Exchange-Online-with-Windows-PowerShell-06a743bb-ceb6-49a9-a61d-db4ffdf54fa6?ui=en-US&rs=en-CA&ad=CA
 
-# This script was originally based on the work posted at the link below, but has been almost completely re-written twice since then:
-# http://365lab.net/2014/04/15/office-365-assign-licenses-based-on-groups-using-powershell/#comment-4353
-
 #General TODOs: 
 # Need better logging and alerts
 # A lot of duplicated code for the two tiers could be consolidated
