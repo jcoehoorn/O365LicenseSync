@@ -2,7 +2,7 @@
 
 #Acknowledgements:
 # This script was original based on the work by Johan Dahlbom located here:
-# http://365lab.net/2014/04/15/office-365-assign-licenses-based-on-groups-using-powershell/#comment-4353
+# http://365lab.net/2014/04/15/office-365-assign-licenses-based-on-groups-using-powershell/
 # However, it has been almost completely re-written twice since then, and boasts significant added functionality.
 
 #This script syncs Office 365 license assignments from group membership in the Azure Active Directory Tenant.
