@@ -1,169 +1,214 @@
-﻿#Copyright 2015 Joel Coehoorn. 
+# Requires MS Graph Powershell module (via PowershellGet)
 
-#Acknowledgements:
-# This script was original based on the work by Johan Dahlbom located here:
-# http://365lab.net/2014/04/15/office-365-assign-licenses-based-on-groups-using-powershell/
-# However, it has been almost completely re-written twice since then, and boasts significant added functionality.
+# Remember: this looks at group memberships in Azure Entra, NOT in AD directly. 
+# So don't assume you  run this immediately after a group change in AD in order to assign a license. 
+# You need to wait for the DirectorySync (or similar) tool to catch up first, and the timing for that is non-deterministic.
+ 
+# TODO: Add notes about certificate rotation to this location.
 
-#This script syncs Office 365 license assignments from group membership in the Azure Active Directory Tenant.
-# Adjust the variable assignments in the first section to match your environment.
-# This script assumes you already have your Active Directory syncing to Azure, and does NOT address setting that up.
-# This script should be set to run as a scheduled task in your local environment on a machine that has the Office 365 commandlets installed.
-# No support is provided for configuring your local Active Directory to the Azure tenant, and no support is provided for installing the powershell commandlets. Support inquiries in those areas will be ignored.
-# A general guide to configuring your local environment is available here: https://support.office.com/en-ca/article/Managing-Office-365-and-Exchange-Online-with-Windows-PowerShell-06a743bb-ceb6-49a9-a61d-db4ffdf54fa6?ui=en-US&rs=en-CA&ad=CA
-
-#General TODOs: 
-# Need better logging and alerts
-# A lot of duplicated code for the two tiers could be consolidated
-
-#Note - the Script Requires PowerShell 3.0
-Import-Module MSOnline
-
-#Office 365 Admin Credentials
-$CloudUsername = '<username here>'  #often something like admin@<tenant>.onmicrosoft.com
-$CloudPassword = ConvertTo-SecureString '<password here>' -AsPlainText -Force #yes, you have to hard-code a password :(. Be sure to keep the script somewhere protected
-$UsageLocation = 'US' #United States. More codes here: https://www.iso.org/obp/ui/#search/code/
+# base data
+$UsageLocation = 'US' #United States
 $tenant = '<tenant name here>'
+$log = "path to log file here"
 
-#Special IDs that may be licensed for, say, testing, but are not in the synced group, and should never be removed (at least not automatically removed)
-$SpecialsIDs = @([GUID]("00000000-0000-0000-0000-000000000000"))
+# This depends on app defined in Entra with appropriate permissions 
+# Authentication to the app is via AppID and certificate.
+$appClient = "Entra Application (client) ID here (will be a guid string)" # This is analogous to the username, rather than password, so safe to leave in the script
+# The certficiate should be installed to local computer store, as well as set in the Entra application.
+$cert = "O365License" # TODO: select by thumbprint instead. (Getting thumbprints is awkward, but worth it at cert renewal time). Also make sure the script account has access to manage the private key
 
-#This is intended for two tiers (student/employee), such that users will never need a mix of the tiers. Multiple AD Groups and SKUs are supported for each tier.
-# Users in the 2nd tier will always only get those license SKUs... if they are in both tiers, only the 2nd tier licenses will be applied.
-# A long list of possible SKUs is available here: http://blogs.technet.com/b/treycarlee/archive/2013/11/01/list-of-powershell-licensing-sku-s-for-office-365.aspx
-# Mostly, though, I found the SKUs I needed by assigning the license to my own account via the GUI and then asking Powershell what licenses I have
-# TODO: Generalize Student/Employee names
 $data = @{
-	'Student' = @{ 
-		LicenseSKUs = @("$($tenant):OFFICESUBSCRIPTION_STUDENT", "$($tenant):STANDARDWOFFPACK_STUDENT")
-		Groups = @('StudentsGroup')
-		GroupIDs = @()
-		Members = @()
-		IDs = @()       
-	}
-
-	'Employee' = @{ 
-		LicenseSKUs = @("$($tenant):STANDARDWOFFPACK_FACULTY","$($tenant):OFFICESUBSCRIPTION_FACULTY" )
-		Groups = @('EmployeeGroup')  
-		GroupIDs = @()
-		Members = @()
-		IDs = @()
-	}
+    'Student' = @{ 
+        LicenseSKUs = @(  "OFFICESUBSCRIPTION_STUDENT", "STANDARDWOFFPACK_STUDENT")
+        Groups = @('Students', 'OnlineStudents')
+        GroupIDs = @()
+        Members = @()
+        IDs = @()       
+    }                         
+             
+    'Employee' = @{ 
+        LicenseSKUs = @("STANDARDWOFFPACK_FACULTY","OFFICESUBSCRIPTION_FACULTY", "POWER_BI_STANDARD_FACULTY" )
+		# LicenseSKUs = @("$($tenant):OFFICESUBSCRIPTION_FACULTY")
+        Groups = @('FacultyAdmin','FACULTY')  # Do not include GAs or EMPLOYEES (GAs can be students, and Employees is not always cleaned out fast enough)
+        GroupIDs = @()
+        Members = @()
+        IDs = @()
+     }
 }
-######################################
-#End of settings
 
-Write-Output "Preparing synchronization data"
+ac -Path $log "$(get-date) - Starting"
 
-#Connect to Office 365 
-$CloudCred = New-Object System.Management.Automation.PSCredential $CloudUsername, $CloudPassword
-Connect-MsolService -Credential $CloudCred
+write-output "Connecting to Entra"
+ac -Path $log "$(get-date) - Connecting to Entra"
 
-$data.Student.GroupIDs = (Get-MsolGroup -All | ?{ $data.Student.Groups -contains $_.DisplayName } ).ObjectId
-$data.Employee.GroupIDs = (Get-MsolGroup -All | ?{ $data.Employee.Groups -contains $_.DisplayName } ).ObjectId
+try {
+    Connect-MgGraph -ClientID $appClient -TenantId "$tenant.onmicrosoft.com"  -CertificateName "CN=$cert"
+}
+catch {
+    ac -Path $log "$(get-date) - Error connecting to Entra. Message below. Exiting early"
+    ac -Path $log $($_.Exception.Message)
+    exit
+}
 
-#Student license users
+Write-Output "Prepping group membership data"
+ac -Path $log "$(get-date) - Prepping group membership data"
+
+# TODO: We're a school, for goodness sake. How likely is it we end up with more than one group at different points the AD OU heirarcy named "Students"? VERY.
+#  Therefore we may need to be more specific than "DisplayName" in the future.
+$data.Student.GroupIDs = (Get-MgGroup -All | ?{ $data.Student.Groups -contains $_.DisplayName } ).Id
+$data.Employee.GroupIDs = (Get-MgGroup -All | ?{ $data.Employee.Groups -contains $_.DisplayName } ).Id
+
+# Student License users
 foreach( $id in $data.Student.GroupIDs)
 {
-	$data.Student.Members =  $data.Student.Members + (Get-MsolGroupMember -GroupObjectId $id -All)
+    $data.Student.IDs =  $data.Student.IDs + (Get-MgGroupMember -GroupId $id -All).Id
 }
-$data.Student.Members = $data.Student.Members | Sort-Object -property EmailAddress -Unique
-$data.Student.IDs = ($data.Student.Members).ObjectId
+$data.Student.IDs = $data.Student.IDs | select -u
 
-#Employee license users
-#TODO: abstract to method, reuse code from student section
+# Employee license users -- TODO: convert to method
 foreach( $id in $data.Employee.GroupIDs)
 {
-	$data.Employee.Members =  $data.Employee.Members + (Get-MsolGroupMember -GroupObjectId $id -All)
+    $data.Employee.IDs =  $data.Employee.IDs + (Get-MgGroupMember -GroupId $id -All).Id
 }
-$data.Employee.Members = $data.Employee.Members | Sort-Object -property EmailAddress -Unique
-$data.Employee.IDs = ($data.Employee.Members).ObjectId
+$data.Employee.IDs = $data.Employee.IDs | select -u
 
-##############
-#Some employees are also students. In these cases, only assign the employee license SKUs (exclude from student if also in employee)
-# If you don't want this behaviour (you want the employee group to be additive, the union of the two permissions) just comment out these two lines below
-# Be warned that a number of SKU's conflict with each other. It's not always possible to just add a license, and in many markets it can be expensive.
-$data.Student.Members = $data.Student.Members | ?{ -not ( $data.Employee.IDs -contains $_.ObjectId)}
+# Remove GAs from the employees list. At least for this purpose, they should be treated as students, and can and will get those licenses instead.
+# TODO: make this part of the data
+$GAGroup = (Get-MgGroup -All | ?{ "GAs" -eq $_.Displayname }).Id
+$GAs = (Get-MgGroupMember -GroupId $GAGroup -All).Id
+$data.Employee.IDs = $data.Employee.IDs | ?{ -not ( $GAs -contains $_) }
+
+# #############
+# Some employees are also students. In these cases, only assign the employee license SKUs (exclude from student if also in employee)
 $data.Student.IDs = $data.Student.IDs | ?{ -not ( $data.Employee.IDs -contains $_) }
-##############
+# #############
 
 $SKUs  = @{}
-$AllUsers = Get-MsolUser -All | ?{ $_.IsLicensed -eq "TRUE"} #Can be slow. Unfortunately, we need this to know who has what specific licenses already assigned
+$errors = ""
+$errorCount = 0
 
-#Compute changes to Student tier
+# TODO: this organizes the operations by license, which may require several operations per user.
+#      If we load them into a dictionary instead (or something sortable, so we sort for removals first),
+#      then the new APIs may let us get this to one operation per user that handles any additions/removals all at once.
+
+Write-Output "Computing Student changes"
+ac -Path $log "$(get-date) - Computing Student changes"
 foreach ($sku in $data.Student.LicenseSKUs)
 {
-	$AccountSKU = Get-MsolAccountSku | Where-Object {$_.AccountSKUID -eq $sku}
-	$LicensedIDs  = ($ALLUsers | ?{  ($_.Licenses | ?{ $_.AccountSkuId -eq $sku}).Length -gt 0}).ObjectId 
+    # TODO: Try/catch blocks if an API call fails
+    $AccountSKU = Get-MgSubscribedsku | Where-Object {$_.SkuPartNumber -eq $sku}
 
-	$Extra = $LicensedIDs |  ?{ -not ( $data.Student.IDs -contains $_)} | ?{ -not ( $SpecialsIDs -contains $_ )}
-	$NeedLicense = $data.Student.IDs | ?{-not  ($LicensedIDs -contains $_)}
+    $LicensedIDs  = (Get-MgUser -Filter "assignedLicenses/any(x:x/skuId eq $($AccountSKU.SkuId) )" -All).Id
 
-	$SKUs.Add($sku, @{
-		'AccountSKU'=$AccountSKU
-		'Extra' = $Extra
-		'Needed' = $NeedLicense
-	})
+    $Extra = $LicensedIDs |  ?{ -not ( $data.Student.IDs -contains $_)} | ?{ -not ( $SpecialsIDs -contains $_ )}
+    $NeedLicense = $data.Student.IDs | ?{-not  ($LicensedIDs -contains $_)}
 
-	if ($AccountSKU.ActiveUnits -lt $data.Student.IDs.Length) { 
-		Write-Warning "Not enough $sku licenses for all students, please remove user licenses or buy more licenses"
+    $SKUs.Add($sku, @{
+            'AccountSKU'=$AccountSKU
+            'Extra' = $Extra
+            'Needed' = $NeedLicense
+        })
+
+	# These are warnings: don't add to error count (there'll be enough of those later)
+	if ($AccountSKU.PrepaidUnits.Enabled -le 0) {
+		Write-Warning "No $sku licenses found!"
+		$errors += "`nNo $sku license found!"
+	}
+    elseif ($AccountSKU.PrepaidUnits.Enabled -lt $data.Student.IDs.Length) { 
+		Write-Warning "Not enough $sku licenses for all students (need $($data.Student.IDs.Length), have $($AccountSKU.PrepaidUnits.Enabled)). Remove user licenses or buy more licenses"
+		$errors += "Not enough $sku licenses for all students (need $($data.Student.IDs.Length), have $($AccountSKU.PrepaidUnits.Enabled)). Remove user licenses or buy more licenses`n"
 		#TODO: Create an alert of some kind for this
 	}
 }
 
-#Compute changes to Employee tier 
-#TODO: re-use code from student section
+Write-Output "Computing Employee changes"
+ac -Path $log "$(get-date) - Computing Employee changes"
 foreach ($sku in $data.Employee.LicenseSKUs)
 {
-	$AccountSKU = Get-MsolAccountSku | Where-Object {$_.AccountSKUID -eq $sku}
-	$LicensedIDs  = ($AllUsers | ?{  ($_.Licenses | ?{ $_.AccountSkuId -eq $sku}).Length -gt 0}).ObjectId
+    $AccountSKU = Get-MgSubscribedsku | Where-Object {$_.SkuPartNumber -eq $sku}
 
-	$Extra = $LicensedIDs |  ?{ -not ( $data.Employee.IDs -contains $_)} | ?{ -not ( $SpecialsIDs -contains $_ )}
-	$NeedLicense = $data.Employee.IDs | ?{-not  ($LicensedIDs -contains $_)}
+    $LicensedIDs  = (Get-MgUser -Filter "assignedLicenses/any(x:x/skuId eq $($AccountSKU.SkuId) )" -All ).Id
 
-	$SKUs.Add($sku, @{
-			'AccountSKU'=$AccountSKU
-			'Extra' = $Extra
-			'Needed' = $NeedLicense
-		})
+    $Extra = $LicensedIDs |  ?{ -not ( $data.Employee.IDs -contains $_)} | ?{ -not ( $SpecialsIDs -contains $_ )}
+    $NeedLicense = $data.Employee.IDs | ?{-not  ($LicensedIDs -contains $_)}
 
-	if ($AccountSKU.ActiveUnits -lt $data.Employee.IDs.Length) { 
-		Write-Warning "Not enough $sku licenses for all employees, please remove user licenses or buy more licenses"
+    $SKUs.Add($sku, @{
+            'AccountSKU'=$AccountSKU
+            'Extra' = $Extra
+            'Needed' = $NeedLicense
+        })
+
+	# These are warnings: don't add to error count (there'll be enough of those later)
+	if ($AccountSKU.PrepaidUnits.Enabled -le 0) {
+		Write-Warning "No $sku licenses found!"
+		$errors += "`nNo $sku license found!"
+	}
+    elseif ($AccountSKU.PrepaidUnits.Enabled -lt $data.Employee.IDs.Length) { 
+		Write-Warning "Not enough $sku licenses for all employees (need $($data.Employee.IDs.Length), have $($AccountSKU.PrepaidUnits.Enabled)). Remove user licenses or buy more licenses"
+		$errors += "Not enough $sku licenses for all employees (need $($data.Employee.IDs.Length), have $($AccountSKU.PrepaidUnits.Enabled)). Remove user licenses or buy more licenses`n"
 		#TODO: Create an alert of some kind for this
-	}
+    }
+	
 }
 
-#Need to avoid both license conflicts and exceeding license counts, so remove everywhere before adding
+# Need to avoid both license conflicts and exceeding license counts, so remove everywhere before adding
+Write-Output "Syncing license assignments"
+ac -Path $log "$(get-date) - Syncing license assignments"
 foreach ($s in $SKUs.Keys)
 {
-	$sku = $SKUs[$s]
-	Write-Output "Removing $($sku.Extra.Length) users from $s license." 
+    $sku = $SKUs[$s]
+    Write-Output "Removing $($sku.Extra.Length) users from $s license." 
+    ac -Path $log "$(get-date) - Removing $($sku.Extra.Length) users from $s license." 
 
-	foreach ($User in $sku.Extra) {
-		Try {
-			$userName = (Get-MsolUser -ObjectId $User).UserPrincipalName
-			Set-MsolUserLicense -ObjectId $User -RemoveLicenses $sku.AccountSKU.AccountSkuId -ErrorAction Stop -WarningAction Stop        
-			Write-Output "Successfully removed $s license for $userName with ID: $User"
-		} catch {
-			Write-Warning "Error when removing licensing from $userName`r`n$_"
-		}
-	}
+    foreach ($User in $sku.Extra) {		
+        Try {                                
+            $u = Set-MgUserLicense -UserId $User -AddLicenses @() -RemoveLicenses @($sku.AccountSKU.SkuId) -ErrorAction Stop -WarningAction Stop        
+            Write-Output "Successfully removed $s license for user $($u.UserPrincipalName)" 
+            # Don't log each user change -- too noisy -- but do write it to the console if we're running interactively, and do track the error if we get one
+        } catch {
+			$errorCount += 1
+            try {
+                $userName = (Get-MgUser -UserID $User).UserPrincipalName  
+            } catch {$userName = $User} # At least we'll have the Id
+
+			$msg = "Error when removing $s license from user $userName : `n $($_.Exception.Message)`r`n"
+            Write-Warning $msg
+			$errors += "$msg"
+        } 
+    }
 }
 
-#Now add missing users
+# Now add missing users
 foreach ($s in $SKUs.Keys)
 {
-	$sku = $SKUs[$s]  
-	Write-Output "Adding $($sku.Needed.Length) users to $s license."
+    $sku = $SKUs[$s]  
+    Write-Output "Adding $($sku.Needed.Length) users to $s license."
+    ac -Path $log "$(get-date) - Adding $($sku.Needed.Length) users to $s license." 
 
-	foreach ($User in $sku.Needed) {
-		Try {
-			$userName = (Get-MsolUser -ObjectId $User).UserPrincipalName
-			Set-MsolUser -ObjectId $User -UsageLocation $UsageLocation -ErrorAction Stop -WarningAction Stop
-			Set-MsolUserLicense -ObjectId $User -AddLicenses $sku.AccountSKU.AccountSkuId -ErrorAction Stop -WarningAction Stop
-			Write-Output "Successfully added $s license for user $userName with ID: $User"
-		} catch {
-			Write-Warning "Error when licensing user: $Username`r`n$_"
-		}
-	}
-}
+    $toAdd = @(  @{SkuId = $sku.AccountSKU.SkuId} ) # Different from Remove: need array of objects instead of just IDs, 
+
+    foreach ($User in $sku.Needed) {
+		# Users are missing this by default, and it blocks adding licenses... doesn't hurt to keep setting it
+		Update-MGUser -UserID $User -UsageLocation "US"
+        Try {            
+            $u = Set-MgUserLicense -UserId $User -AddLicenses $toAdd -RemoveLicenses @() -ErrorAction Stop -WarningAction Stop  
+            Write-Output "Successfully added $s license for user $($u.UserPrincipalName)" 
+            # Don't log each user change -- too noisy -- but do write it to the console if we're running interactively, and do track the error if we get one
+        } catch {
+			$errorCount += 1
+            try {
+                $userName = (Get-MgUser -UserID $User).UserPrincipalName 
+            } catch { $userName = $User  } # At least we'll have the Id
+			$msg = "Error when adding $s license for user $userName : $($_.Exception.Message)`n"
+            Write-Warning $msg
+			$errors += "$msg"
+        }   
+    }
+ }
+ 
+ if ($errorCount -gt 0)
+ {
+	ac -Path $log  "$(get-date) - Found $errorCount errors:`n$errors"
+ }
+
+ ac -Path $log  "$(get-date) - Finished`n"
